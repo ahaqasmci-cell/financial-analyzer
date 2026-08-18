@@ -25,24 +25,23 @@ if uploaded_file is not None:
                             raw_data.append(clean_row)
 
         if len(raw_data) > 1:
-            # استخدام الصف الأول من الكشف نفسه كعناوين للأعمدة لضمان تطابق البيانات تماماً
             headers = raw_data[0]
             df = pd.DataFrame(raw_data[1:], columns=headers)
 
-            # تنظيف أي صفوف مكررة تحتوي على العناوين داخل الجداول
+            # تصفية الصفوف المكررة التي تحتوي العناوين
             df = df[~df.isin(headers).all(axis=1)]
 
             st.success("تم تحليل الكشف واستخراج الجداول بنجاح! 🎉")
 
-            tab1, tab2 = st.tabs(["📋 الكشف المفرغ (Data)", "📈 ملخص العمليات"])
+            tab1, tab2 = st.tabs(["📋 الكشف المفرغ (Data)", "📈 ملخص التحليل المالي"])
 
             with tab1:
                 st.dataframe(df, use_container_width=True)
                 
-                # تصدير إكسل حقيقي (.xlsx) متوافق 100% مع أجهزة الآيفون واللغة العربية
+                # تصدير Excel (.xlsx) معتمد ومتوافق مع الآيفون
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='KSA_Bank_Report')
+                    df.to_excel(writer, index=False, sheet_name='Bank_Report')
                 excel_data = output.getvalue()
                 
                 st.download_button(
@@ -55,6 +54,7 @@ if uploaded_file is not None:
             with tab2:
                 st.write("### إحصائيات عامة")
                 st.metric("إجمالي عدد العمليات المستخرجة", len(df))
-                st.dataframe(df, use_container_width=True)
+                st.dataframe(df.head(10), use_container_width=True)
+
         else:
             st.error("لم يتم العثور على جداول واضحة داخل ملف PDF.")
