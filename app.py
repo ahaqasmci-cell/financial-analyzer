@@ -11,62 +11,51 @@ st.write("---")
 uploaded_file = st.file_uploader("قم برفع كشف الحساب (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
-    with st.spinner("جاري تحليل البيانات..."):
-        transactions = []
+    with st.spinner("جاري تحليل الكشف البنكي وتنسيق البيانات..."):
+        all_rows = []
+        
+        # قراءة كل الجداول من كافة صفحات الـ PDF
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
-                table = page.extract_table()
-                if table:
-                    for row in table[1:]:
-                        if len(row) >= 4:
-                            transactions.append(row)
+                tables = page.extract_tables()
+                for table in tables:
+                    for row in table:
+                        # تصفية الصفوف والتأكد من وجود بيانات
+                        clean_row = [str(cell).strip().replace('\n', ' ') for cell in row if cell is not None and str(cell).strip() != '']
+                        if len(clean_row) >= 3: # يتجاهل الصفوف الفارغة أو الضبابية
+                            all_rows.append(clean_row)
 
-        df = pd.DataFrame(transactions, columns=["التاريخ", "البيان", "المدين (صادر)", "الدائن (وارد)"])
-        df["المدين (صادر)"] = pd.to_numeric(df["المدين (صادر)"].str.replace(',', ''), errors='coerce').fillna(0)
-        df["الدائن (وارد)"] = pd.to_numeric(df["الدائن (وارد)"].str.replace(',', ''), errors='coerce').fillna(0)
+        if len(all_rows) > 1:
+            # تحويل البيانات القادمة بغض النظر عن عدد الأعمدة
+            max_cols = max(len(r) for r in all_rows)
+            headers = [f"عمود {i+1}" for i in range(max_cols)]
+            
+            # محاولة تسمية أهم الأعمدة
+            if max_cols >= 4:
+                headers[0] = "التاريخ"
+                headers[1] = "البيان / الوصف"
+                headers[-2] = "المدين (صادر)"
+                headers[-1] = "الدائن (وارد)"
 
-        def classify_type(row):
-            text = str(row["البيان"])
-            if row["الدائن (وارد)"] > 0:
-                if "نقدي" in text: return "إيداع نقدي"
-                elif "شيك" in text: return "شيك وارد"
-                else: return "حوالة واردة"
-            else: return "حوالة صادرة / مصروفات"
+            df = pd.DataFrame(all_rows[1:], columns=headers[:max_cols])
 
-        df["نوع العملية"] = df.apply(classify_type, axis=1)
+            # معالجة وتنظيف الأرقام
+            for col in df.columns:
+                if "صادر" in col or "وارد" in col or "مبلغ" in col:
+                    df[col] = pd.to_numeric(df[col].str.replace(',', ''), errors='coerce').fillna(0)
 
-        def extract_entity(text):
-            text = str(text)
-            for prefix in ["شركة ", "مؤسسة ", "فرع "]:
-                if prefix in text:
-                    return prefix + text.split(prefix)[1].split("-")[0].strip()
-            return "جهات عامة / أخرى"
+            st.success("تم تحليل الكشف واستخراج الجداول بنجاح! 🎉")
 
-        df["المتعامل"] = df["البيان"].apply(extract_entity)
+            tab1, tab2 = st.tabs(["📋 الكشف المفرغ (Data)", "📈 ملخص العمليات"])
 
-    st.success("تم التحليل بنجاح! 🎉")
+            with tab1:
+                st.dataframe(df, use_container_width=True)
+                csv = df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button("📥 تصدير إلى Excel (CSV)", csv, "Bank_Analysis.csv", "text/csv")
 
-    tab1, tab2, tab3 = st.tabs(["📋 الكشف (Excel)", "📈 التحليل", "👥 المتعاملين"])
-
-    with tab1:
-        st.dataframe(df)
-        csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 تصدير ملف CSV", csv, "Bank_Analysis.csv", "text/csv")
-
-    with tab2:
-        total_in = df["الدائن (وارد)"].sum()
-        total_out = df["المدين (صادر)"].sum()
-        st.metric("إجمالي الوارد", f"{total_in:,.2f} ر.س")
-        st.metric("إجمالي الصادر", f"{total_out:,.2f} ر.س")
-        st.write("---")
-        st.write("### توزيع الإيداعات")
-        deposits_df = df[df["الدائن (وارد)"] > 0].groupby("نوع العملية")["الدائن (وارد)"].sum()
-        st.bar_chart(deposits_df)
-
-    with tab3:
-        entities = df.groupby("المتعامل").agg(
-            عدد_العمليات=("التاريخ", "count"),
-            إجمالي_الوارد=("الدائن (وارد)", "sum"),
-            إجمالي_الصادر=("المدين (صادر)", "sum")
-        ).reset_index()
-        st.dataframe(entities)
+            with tab2:
+                st.write("### إحصائيات عامة")
+                st.metric("إجمالي عدد العمليات المستخرجة", len(df))
+                st.dataframe(df.describe(include='all').fillna(''), use_container_width=True)
+        else:
+            st.error("لم يتم العثور على جداول واضحة داخل ملف PDF، يرجى التأكد من أن الملف يحتوي على كشف رقمي أو صورة ممسوحة جيدة.")
