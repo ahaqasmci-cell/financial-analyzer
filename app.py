@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import pdfplumber
+import io
 
 st.set_page_config(page_title="المحلل المالي الذكي", layout="centered")
 
@@ -24,20 +25,12 @@ if uploaded_file is not None:
                             raw_data.append(clean_row)
 
         if len(raw_data) > 1:
-            df_raw = pd.DataFrame(raw_data)
-            
-            # محاولة ضبط ترتيب أعمدة الإنماء تلقائياً من اليمين لليسار
-            # إذا كان العمود الأخير يحتوي نص يحتوي SAR أو وصف، نعكس الترتيب
-            df = df_raw.iloc[1:].copy()
-            
-            # إعادة تسمية الأعمدة بشكل منظم بناءً على عددها
-            num_cols = df.shape[1]
-            if num_cols == 4:
-                df.columns = ["الرصيد", "المبلغ", "البيان / التفاصيل", "التاريخ"]
-            elif num_cols == 5:
-                df.columns = ["الرصيد", "دائن", "مدين", "البيان / التفاصيل", "التاريخ"]
-            else:
-                df.columns = [f"عمود {i+1}" for i in range(num_cols)]
+            # استخدام الصف الأول من الكشف نفسه كعناوين للأعمدة لضمان تطابق البيانات تماماً
+            headers = raw_data[0]
+            df = pd.DataFrame(raw_data[1:], columns=headers)
+
+            # تنظيف أي صفوف مكررة تحتوي على العناوين داخل الجداول
+            df = df[~df.isin(headers).all(axis=1)]
 
             st.success("تم تحليل الكشف واستخراج الجداول بنجاح! 🎉")
 
@@ -46,13 +39,17 @@ if uploaded_file is not None:
             with tab1:
                 st.dataframe(df, use_container_width=True)
                 
-                # تصدير CSV بترميز وتنسيق يضمن الفصل التلقائي بين الأعمدة في إكسل Excel
-                csv_data = df.to_csv(index=False, sep=',', encoding='utf-8-sig')
+                # تصدير إكسل حقيقي (.xlsx) متوافق 100% مع أجهزة الآيفون واللغة العربية
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='KSA_Bank_Report')
+                excel_data = output.getvalue()
+                
                 st.download_button(
-                    label="📥 تصدير إلى Excel (CSV)",
-                    data=csv_data,
-                    file_name="Alinma_Bank_Analysis.csv",
-                    mime="text/csv"
+                    label="📥 تصدير إلى Excel (.xlsx)",
+                    data=excel_data,
+                    file_name="Bank_Analysis_Report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
             with tab2:
