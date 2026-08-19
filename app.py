@@ -102,17 +102,65 @@ def extract_via_text(pdf):
     return raw_rows
 
 
-def extract_via_ocr(file_bytes, lang='ara+eng'):
-    """آخر خطة: تحويل صفحات PDF لصور واستخراج النص عبر Tesseract OCR."""
+def extract_via_ocr(file_bytes, lang='ara+eng', col_gap_px=40):
+    """
+    آخر خطة: تحويل صفحات PDF لصور واستخراج النص عبر Tesseract OCR.
+    يعتمد على إحداثيات كل كلمة (image_to_data) لتجميعها في أسطر ثم أعمدة،
+    بدل الاعتماد على المسافات النصية التي غالبًا لا تكون دقيقة في مخرجات OCR.
+    """
+    from pytesseract import Output
     raw_rows = []
-    images = convert_from_bytes(file_bytes, dpi=300)
+    debug_text_pages = []
+
+    try:
+        images = convert_from_bytes(file_bytes, dpi=300)
+    except Exception as e:
+        return raw_rows, [f"فشل تحويل PDF لصور: {e}"]
+
     for img in images:
-        text = pytesseract.image_to_string(img, lang=lang)
-        for line in text.split('\n'):
-            parts = [p for p in re.split(r'\s{2,}', line.strip()) if p != '']
-            if len(parts) >= 3:
-                raw_rows.append(parts)
-    return raw_rows
+        try:
+            data = pytesseract.image_to_data(img, lang=lang, output_type=Output.DICT)
+        except Exception as e:
+            # قد تكون حزمة اللغة العربية غير مثبتة على السيرفر
+            try:
+                data = pytesseract.image_to_data(img, lang='eng', output_type=Output.DICT)
+                debug_text_pages.append(f"تحذير: تعذر استخدام اللغة العربية ({e})، تم الرجوع للإنجليزية فقط.")
+            except Exception as e2:
+                debug_text_pages.append(f"فشل OCR كليًا على هذه الصفحة: {e2}")
+                continue
+
+        # نص الصفحة كاملاً لأغراض التشخيص فقط
+        debug_text_pages.append(' '.join(w for w in data.get('text', []) if w.strip()))
+
+        # تجميع الكلمات في أسطر بناءً على (block, paragraph, line)
+        lines = {}
+        for i, word in enumerate(data['text']):
+            word = word.strip()
+            if word == '':
+                continue
+            key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+            lines.setdefault(key, []).append({
+                'text': word,
+                'left': data['left'][i],
+                'top': data['top'][i],
+            })
+
+        # ترتيب الأسطر من الأعلى للأسفل
+        for key, words in sorted(lines.items(), key=lambda kv: min(w['top'] for w in kv[1])):
+            words_sorted = sorted(words, key=lambda w: w['left'])
+            columns = []
+            current = [words_sorted[0]]
+            for w in words_sorted[1:]:
+                if w['left'] - current[-1]['left'] > col_gap_px:
+                    columns.append(' '.join(x['text'] for x in current))
+                    current = [w]
+                else:
+                    current.append(w)
+            columns.append(' '.join(x['text'] for x in current))
+            if len(columns) >= 3:
+                raw_rows.append(columns)
+
+    return raw_rows, debug_text_pages
 
 
 # ============================================================
@@ -221,6 +269,10 @@ with st.expander("⚙️ إعدادات متقدمة"):
         value=True, disabled=not OCR_AVAILABLE,
         help="يحتاج تثبيت: pytesseract, pdf2image, وبرنامج tesseract + poppler على السيرفر" if not OCR_AVAILABLE else None
     )
+    col_gap_px = st.slider(
+        "المسافة بين الأعمدة عند OCR (بالبكسل) — زِد الرقم لو تجمّعت أعمدة معًا خطأ، قلّله لو تفرقت خطأ",
+        min_value=15, max_value=100, value=40, step=5, disabled=not OCR_AVAILABLE
+    )
 
 uploaded_file = st.file_uploader("قم برفع كشف الحساب (PDF)", type=["pdf"])
 
@@ -235,18 +287,25 @@ if uploaded_file is not None:
                 raw_data = extract_via_text(pdf)
                 extraction_method = "استخراج نصي احتياطي (extract_text)"
 
+        ocr_debug_pages = []
         if len(raw_data) < 2 and use_ocr and OCR_AVAILABLE:
             with st.spinner("لم يتم إيجاد نص مباشر — جاري تشغيل OCR (قد يستغرق دقيقة)..."):
-                raw_data = extract_via_ocr(file_bytes)
+                raw_data, ocr_debug_pages = extract_via_ocr(file_bytes, col_gap_px=col_gap_px)
                 extraction_method = "التعرف الضوئي على الحروف (OCR)"
 
         if len(raw_data) < 2:
-            msg = "لم يتم العثور على بيانات واضحة داخل ملف PDF."
+            msg = "لم يتم العثور على بيانات منظمة في جدول داخل ملف PDF."
             if not OCR_AVAILABLE:
                 msg += " الملف يبدو ممسوحًا ضوئيًا ويحتاج OCR — لكن مكتبات OCR غير مثبتة على هذا السيرفر (راجع ملاحظة packages.txt بالأسفل)."
+            elif not use_ocr:
+                msg += " فعّل خيار OCR من الإعدادات المتقدمة أعلاه."
             else:
-                msg += " جُرّب OCR أيضًا ولم ينجح — قد تكون جودة المسح ضعيفة."
+                msg += " جُرّب OCR وقرأ نصًا، لكن تعذّر تقسيمه لأعمدة بالإعدادات الحالية — جرّب تغيير 'المسافة بين الأعمدة' من الإعدادات المتقدمة، أو راجع النص الخام أدناه."
             st.error(msg)
+            if ocr_debug_pages:
+                with st.expander("🔍 عرض النص الخام الذي استخرجه OCR (لأغراض التشخيص)"):
+                    for i, txt in enumerate(ocr_debug_pages, 1):
+                        st.text_area(f"صفحة {i}", txt, height=150)
         else:
             def process_cell(cell):
                 if apply_reversal:
