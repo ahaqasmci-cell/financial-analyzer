@@ -7,7 +7,7 @@ import re
 st.set_page_config(page_title="المحلل المالي الذكي", layout="centered")
 
 # ============================================================
-# مكتبات تشكيل النص العربي (اختيارية)
+# مكتبات اختيارية: تشكيل النص العربي + OCR للملفات الممسوحة ضوئيًا
 # ============================================================
 try:
     import arabic_reshaper
@@ -15,6 +15,13 @@ try:
     ARABIC_LIBS_AVAILABLE = True
 except ImportError:
     ARABIC_LIBS_AVAILABLE = False
+
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 
 def fix_arabic_display(text):
@@ -49,7 +56,6 @@ def clean_amount(value):
 
 
 def suggest_header_name(raw_name):
-    """يقترح اسم عمود عربي واضح بناءً على كلمات مفتاحية موجودة بالاسم الخام."""
     n = str(raw_name).lower()
     if 'balance' in n or 'رصيد' in raw_name:
         return 'الرصيد'
@@ -96,9 +102,21 @@ def extract_via_text(pdf):
     return raw_rows
 
 
+def extract_via_ocr(file_bytes, lang='ara+eng'):
+    """آخر خطة: تحويل صفحات PDF لصور واستخراج النص عبر Tesseract OCR."""
+    raw_rows = []
+    images = convert_from_bytes(file_bytes, dpi=300)
+    for img in images:
+        text = pytesseract.image_to_string(img, lang=lang)
+        for line in text.split('\n'):
+            parts = [p for p in re.split(r'\s{2,}', line.strip()) if p != '']
+            if len(parts) >= 3:
+                raw_rows.append(parts)
+    return raw_rows
+
+
 # ============================================================
 # استخراج اسم الطرف الآخر ونوع العملية من نص تفاصيل العملية
-# ملاحظة: الصياغة تختلف من بنك لآخر، هذا اجتهاد عام قابل للتحسين
 # ============================================================
 METHOD_KEYWORDS = [
     ('شيك', 'شيك'),
@@ -123,9 +141,8 @@ NAME_PATTERNS = [
 def classify_method(description):
     if not isinstance(description, str):
         return 'غير محدد'
-    d = description.lower()
     for kw, label in METHOD_KEYWORDS:
-        if kw in description or kw in d:
+        if kw in description or kw in description.lower():
             return label
     return 'أخرى'
 
@@ -136,12 +153,56 @@ def extract_party_name(description):
     for pat in NAME_PATTERNS:
         m = re.search(pat, description)
         if m:
-            name = m.group(1).strip()
-            name = re.sub(r'\s{2,}', ' ', name)
+            name = re.sub(r'\s{2,}', ' ', m.group(1).strip())
             if len(name) >= 3:
                 return name
-    # لا يوجد اسم واضح -> استخدم النص كاملاً كمعرف للتجميع
     return description.strip()[:40]
+
+
+def build_excel(df, general_stats, deposits_summary, beneficiaries_summary, top_tx):
+    """يبني ملف إكسل بورقتين: البيانات الخام + التحليل المالي."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Bank_Report')
+
+        sheet_name = 'التحليل_المالي'
+        row = 0
+
+        if general_stats:
+            pd.DataFrame(general_stats, columns=['المؤشر', 'القيمة']).to_excel(
+                writer, sheet_name=sheet_name, index=False, startrow=row
+            )
+            row += len(general_stats) + 3
+
+        if deposits_summary is not None and not deposits_summary.empty:
+            pd.DataFrame([['أبرز المودعين (عمليات واردة)']]).to_excel(
+                writer, sheet_name=sheet_name, index=False, header=False, startrow=row
+            )
+            row += 2
+            deposits_summary.to_excel(writer, sheet_name=sheet_name, index=False, startrow=row)
+            row += len(deposits_summary) + 3
+
+        if beneficiaries_summary is not None and not beneficiaries_summary.empty:
+            pd.DataFrame([['أبرز المستفيدين (عمليات صادرة)']]).to_excel(
+                writer, sheet_name=sheet_name, index=False, header=False, startrow=row
+            )
+            row += 2
+            beneficiaries_summary.to_excel(writer, sheet_name=sheet_name, index=False, startrow=row)
+            row += len(beneficiaries_summary) + 3
+
+        if top_tx is not None and not top_tx.empty:
+            pd.DataFrame([['أبرز العمليات الفردية']]).to_excel(
+                writer, sheet_name=sheet_name, index=False, header=False, startrow=row
+            )
+            row += 2
+            top_tx.to_excel(writer, sheet_name=sheet_name, index=False, startrow=row)
+
+        if row == 0:
+            pd.DataFrame([['لم يتم تحديد أعمدة كافية لبناء التحليل المالي.']]).to_excel(
+                writer, sheet_name=sheet_name, index=False, header=False
+            )
+
+    return output.getvalue()
 
 
 st.title("📊 المحلل المالي الذكي")
@@ -155,20 +216,37 @@ with st.expander("⚙️ إعدادات متقدمة"):
         value=False, disabled=not ARABIC_LIBS_AVAILABLE,
         help="ثبّت المكتبتين: pip install arabic-reshaper python-bidi" if not ARABIC_LIBS_AVAILABLE else None
     )
+    use_ocr = st.checkbox(
+        "تفعيل OCR للملفات الممسوحة ضوئيًا (أبطأ، يُستخدم فقط عند فشل الطرق الأخرى)",
+        value=True, disabled=not OCR_AVAILABLE,
+        help="يحتاج تثبيت: pytesseract, pdf2image, وبرنامج tesseract + poppler على السيرفر" if not OCR_AVAILABLE else None
+    )
 
 uploaded_file = st.file_uploader("قم برفع كشف الحساب (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
+    file_bytes = uploaded_file.read()
+
     with st.spinner("جاري تحليل الكشف..."):
-        with pdfplumber.open(uploaded_file) as pdf:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             raw_data = extract_via_tables(pdf)
             extraction_method = "جداول PDF (extract_tables)"
             if len(raw_data) < 2:
                 raw_data = extract_via_text(pdf)
                 extraction_method = "استخراج نصي احتياطي (extract_text)"
 
+        if len(raw_data) < 2 and use_ocr and OCR_AVAILABLE:
+            with st.spinner("لم يتم إيجاد نص مباشر — جاري تشغيل OCR (قد يستغرق دقيقة)..."):
+                raw_data = extract_via_ocr(file_bytes)
+                extraction_method = "التعرف الضوئي على الحروف (OCR)"
+
         if len(raw_data) < 2:
-            st.error("لم يتم العثور على بيانات واضحة داخل ملف PDF. قد يكون الملف صورة ممسوحة ضوئيًا وتحتاج OCR.")
+            msg = "لم يتم العثور على بيانات واضحة داخل ملف PDF."
+            if not OCR_AVAILABLE:
+                msg += " الملف يبدو ممسوحًا ضوئيًا ويحتاج OCR — لكن مكتبات OCR غير مثبتة على هذا السيرفر (راجع ملاحظة packages.txt بالأسفل)."
+            else:
+                msg += " جُرّب OCR أيضًا ولم ينجح — قد تكون جودة المسح ضعيفة."
+            st.error(msg)
         else:
             def process_cell(cell):
                 if apply_reversal:
@@ -195,140 +273,147 @@ if uploaded_file is not None:
 
             # ---------- تصحيح أسماء الأعمدة يدويًا ----------
             st.write("### ✏️ تأكيد / تصحيح أسماء الأعمدة")
-            st.caption("النص المستخرج من PDF أحيانًا يظهر بترتيب معكوس. راجع الأسماء المقترحة وعدّلها إذا لزم.")
+            st.caption("راجع الأسماء المقترحة وعدّلها إذا لزم.")
             new_names = {}
-            cols_per_row = 2
             raw_cols = list(df.columns)
-            for i in range(0, len(raw_cols), cols_per_row):
-                cols_ui = st.columns(cols_per_row)
-                for j, orig in enumerate(raw_cols[i:i + cols_per_row]):
+            for i in range(0, len(raw_cols), 2):
+                cols_ui = st.columns(2)
+                for j, orig in enumerate(raw_cols[i:i + 2]):
                     with cols_ui[j]:
                         suggested = suggest_header_name(orig)
                         new_names[orig] = st.text_input(f"العمود: `{orig}`", value=suggested, key=f"col_{i}_{j}")
-
             df = df.rename(columns=new_names)
 
+            # ---------- تحديد الأعمدة (يُحسب مرة واحدة، يُستخدم في العرض والتصدير) ----------
+            st.write("### تحديد الأعمدة")
+            cols = list(df.columns)
+            credit_guess = guess_column(cols, ['دائن', 'إيداع', 'ايداع', 'Credit'])
+            debit_guess = guess_column(cols, ['مدين', 'سحب', 'Debit'])
+            balance_guess = guess_column(cols, ['رصيد', 'Balance'])
+            date_guess = guess_column(cols, ['تاريخ', 'Date'])
+            detail_guess = guess_column(cols, ['تفاصيل', 'بيان', 'وصف', 'Detail', 'Desc'])
+
+            c1, c2 = st.columns(2)
+            with c1:
+                credit_col = st.selectbox("عمود الدائن / الإيداع", ['-- لا يوجد --'] + cols,
+                                           index=(cols.index(credit_guess) + 1) if credit_guess in cols else 0)
+                balance_col = st.selectbox("عمود الرصيد", ['-- لا يوجد --'] + cols,
+                                            index=(cols.index(balance_guess) + 1) if balance_guess in cols else 0)
+                detail_col = st.selectbox("عمود تفاصيل العملية", ['-- لا يوجد --'] + cols,
+                                           index=(cols.index(detail_guess) + 1) if detail_guess in cols else 0)
+            with c2:
+                debit_col = st.selectbox("عمود المدين / السحب", ['-- لا يوجد --'] + cols,
+                                          index=(cols.index(debit_guess) + 1) if debit_guess in cols else 0)
+                date_col = st.selectbox("عمود التاريخ", ['-- لا يوجد --'] + cols,
+                                         index=(cols.index(date_guess) + 1) if date_guess in cols else 0)
+
+            # ---------- حساب كل التحليلات مرة واحدة ----------
+            general_stats = [('إجمالي عدد العمليات', len(df))]
+            total_credit = total_debit = None
+            if credit_col != '-- لا يوجد --':
+                total_credit = df[credit_col].apply(clean_amount).sum()
+                general_stats.append(('إجمالي الإيداعات', f"{total_credit:,.2f}"))
+            if debit_col != '-- لا يوجد --':
+                total_debit = df[debit_col].apply(clean_amount).sum()
+                general_stats.append(('إجمالي السحوبات', f"{total_debit:,.2f}"))
+            if total_credit is not None and total_debit is not None:
+                general_stats.append(('صافي الحركة', f"{total_credit - total_debit:,.2f}"))
+
+            deposits_summary = beneficiaries_summary = top_tx_df = None
+            balances = None
+
+            if balance_col != '-- لا يوجد --':
+                balances = df[balance_col].apply(clean_amount).dropna()
+
+            if detail_col != '-- لا يوجد --':
+                work = df.copy()
+                work['_credit'] = df[credit_col].apply(clean_amount) if credit_col != '-- لا يوجد --' else None
+                work['_debit'] = df[debit_col].apply(clean_amount) if debit_col != '-- لا يوجد --' else None
+                work['_method'] = work[detail_col].apply(classify_method)
+                work['_party'] = work[detail_col].apply(extract_party_name)
+
+                if credit_col != '-- لا يوجد --':
+                    deposits = work[work['_credit'].fillna(0) > 0]
+                    if not deposits.empty:
+                        deposits_summary = deposits.groupby('_party').agg(
+                            عدد_العمليات=('_credit', 'count'),
+                            إجمالي_المبلغ=('_credit', 'sum'),
+                            طرق_الدفع=('_method', lambda s: ', '.join(sorted(set(s))))
+                        ).sort_values('إجمالي_المبلغ', ascending=False).reset_index()
+                        deposits_summary.columns = ['الاسم / الجهة', 'عدد العمليات', 'إجمالي المبلغ', 'نوع العملية']
+
+                if debit_col != '-- لا يوجد --':
+                    withdrawals = work[work['_debit'].fillna(0) > 0]
+                    if not withdrawals.empty:
+                        beneficiaries_summary = withdrawals.groupby('_party').agg(
+                            عدد_العمليات=('_debit', 'count'),
+                            إجمالي_المبلغ=('_debit', 'sum'),
+                            طرق_الدفع=('_method', lambda s: ', '.join(sorted(set(s))))
+                        ).sort_values('إجمالي_المبلغ', ascending=False).reset_index()
+                        beneficiaries_summary.columns = ['الاسم / الجهة', 'عدد العمليات', 'إجمالي المبلغ', 'نوع العملية']
+
+                tx_rows = []
+                for _, r in work.iterrows():
+                    is_credit = r['_credit'] and r['_credit'] > 0
+                    is_debit = r['_debit'] and r['_debit'] > 0
+                    if not is_credit and not is_debit:
+                        continue
+                    tx_rows.append({
+                        'التاريخ': r[date_col] if date_col != '-- لا يوجد --' else '',
+                        'الاسم / الجهة': r['_party'],
+                        'المبلغ': r['_credit'] if is_credit else r['_debit'],
+                        'نوع الحركة': 'واردة (إيداع)' if is_credit else 'صادرة (سحب/تحويل)',
+                        'طريقة العملية': r['_method'],
+                    })
+                if tx_rows:
+                    top_tx_df = pd.DataFrame(tx_rows).sort_values('المبلغ', ascending=False).head(15).reset_index(drop=True)
+
+            excel_bytes = build_excel(
+                df, general_stats,
+                deposits_summary.head(15) if deposits_summary is not None else None,
+                beneficiaries_summary.head(15) if beneficiaries_summary is not None else None,
+                top_tx_df
+            )
+
+            # ---------- العرض ----------
             tab1, tab2 = st.tabs(["📋 الكشف المفرغ", "📈 ملخص التحليل المالي"])
 
             with tab1:
                 st.dataframe(df, use_container_width=True)
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Bank_Report')
                 st.download_button(
-                    "📥 تصدير إلى Excel (.xlsx)", data=output.getvalue(),
-                    file_name="Bank_Analysis_Report.xlsx",
+                    "📥 تصدير إلى Excel (ورقتين: البيانات + التحليل المالي)",
+                    data=excel_bytes, file_name="Bank_Analysis_Report.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
             with tab2:
-                cols = list(df.columns)
-                st.write("### تحديد الأعمدة")
-
-                credit_guess = guess_column(cols, ['دائن', 'إيداع', 'ايداع', 'Credit'])
-                debit_guess = guess_column(cols, ['مدين', 'سحب', 'Debit'])
-                balance_guess = guess_column(cols, ['رصيد', 'Balance'])
-                date_guess = guess_column(cols, ['تاريخ', 'Date'])
-                detail_guess = guess_column(cols, ['تفاصيل', 'بيان', 'وصف', 'Detail', 'Desc'])
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    credit_col = st.selectbox("عمود الدائن / الإيداع", ['-- لا يوجد --'] + cols,
-                                               index=(cols.index(credit_guess) + 1) if credit_guess in cols else 0)
-                    balance_col = st.selectbox("عمود الرصيد", ['-- لا يوجد --'] + cols,
-                                                index=(cols.index(balance_guess) + 1) if balance_guess in cols else 0)
-                    detail_col = st.selectbox("عمود تفاصيل العملية", ['-- لا يوجد --'] + cols,
-                                               index=(cols.index(detail_guess) + 1) if detail_guess in cols else 0)
-                with c2:
-                    debit_col = st.selectbox("عمود المدين / السحب", ['-- لا يوجد --'] + cols,
-                                              index=(cols.index(debit_guess) + 1) if debit_guess in cols else 0)
-                    date_col = st.selectbox("عمود التاريخ", ['-- لا يوجد --'] + cols,
-                                             index=(cols.index(date_guess) + 1) if date_guess in cols else 0)
-
-                st.write("---")
                 st.write("### إحصائيات عامة")
+                metric_cols = st.columns(len(general_stats))
+                for mc, (label, value) in zip(metric_cols, general_stats):
+                    mc.metric(label, value)
 
-                total_credit = total_debit = None
-                m1, m2, m3 = st.columns(3)
-                m1.metric("إجمالي عدد العمليات", len(df))
-                if credit_col != '-- لا يوجد --':
-                    total_credit = df[credit_col].apply(clean_amount).sum()
-                    m2.metric("إجمالي الإيداعات", f"{total_credit:,.2f}")
-                if debit_col != '-- لا يوجد --':
-                    total_debit = df[debit_col].apply(clean_amount).sum()
-                    m3.metric("إجمالي السحوبات", f"{total_debit:,.2f}")
-                if total_credit is not None and total_debit is not None:
-                    st.metric("صافي الحركة", f"{total_credit - total_debit:,.2f}")
+                if balances is not None and not balances.empty:
+                    st.write("### تطور الرصيد")
+                    st.line_chart(balances.reset_index(drop=True))
 
-                if balance_col != '-- لا يوجد --':
-                    balances = df[balance_col].apply(clean_amount).dropna()
-                    if not balances.empty:
-                        st.write("### تطور الرصيد")
-                        st.line_chart(balances.reset_index(drop=True))
-
-                # ---------- تحليل تفاصيل العمليات (يحتاج عمود التفاصيل) ----------
                 if detail_col != '-- لا يوجد --':
-                    work = df.copy()
-                    work['_credit'] = work[credit_col].apply(clean_amount) if credit_col != '-- لا يوجد --' else None
-                    work['_debit'] = work[debit_col].apply(clean_amount) if debit_col != '-- لا يوجد --' else None
-                    work['_method'] = work[detail_col].apply(classify_method)
-                    work['_party'] = work[detail_col].apply(extract_party_name)
-
                     st.write("---")
                     st.write("### 🏦 أبرز المودعين (عمليات واردة)")
-                    if credit_col != '-- لا يوجد --':
-                        deposits = work[work['_credit'].fillna(0) > 0]
-                        if not deposits.empty:
-                            summary = deposits.groupby('_party').agg(
-                                عدد_العمليات=('_credit', 'count'),
-                                إجمالي_المبلغ=('_credit', 'sum'),
-                                طرق_الدفع=('_method', lambda s: ', '.join(sorted(set(s))))
-                            ).sort_values('إجمالي_المبلغ', ascending=False).reset_index()
-                            summary.columns = ['الاسم / الجهة', 'عدد العمليات', 'إجمالي المبلغ', 'نوع العملية']
-                            st.dataframe(summary.head(15), use_container_width=True)
-                        else:
-                            st.info("لا توجد عمليات إيداع في هذا الكشف.")
+                    if deposits_summary is not None:
+                        st.dataframe(deposits_summary.head(15), use_container_width=True)
                     else:
-                        st.info("حدد عمود الدائن/الإيداع أعلاه لعرض هذا التحليل.")
+                        st.info("لا توجد عمليات إيداع، أو لم يُحدَّد عمود الدائن.")
 
                     st.write("### 💸 أبرز المستفيدين (عمليات صادرة)")
-                    if debit_col != '-- لا يوجد --':
-                        withdrawals = work[work['_debit'].fillna(0) > 0]
-                        if not withdrawals.empty:
-                            summary2 = withdrawals.groupby('_party').agg(
-                                عدد_العمليات=('_debit', 'count'),
-                                إجمالي_المبلغ=('_debit', 'sum'),
-                                طرق_الدفع=('_method', lambda s: ', '.join(sorted(set(s))))
-                            ).sort_values('إجمالي_المبلغ', ascending=False).reset_index()
-                            summary2.columns = ['الاسم / الجهة', 'عدد العمليات', 'إجمالي المبلغ', 'نوع العملية']
-                            st.dataframe(summary2.head(15), use_container_width=True)
-                        else:
-                            st.info("لا توجد عمليات سحب/تحويل صادر في هذا الكشف.")
+                    if beneficiaries_summary is not None:
+                        st.dataframe(beneficiaries_summary.head(15), use_container_width=True)
                     else:
-                        st.info("حدد عمود المدين/السحب أعلاه لعرض هذا التحليل.")
+                        st.info("لا توجد عمليات سحب/تحويل صادر، أو لم يُحدَّد عمود المدين.")
 
                     st.write("### 🔝 أبرز العمليات الفردية (الأكبر مبلغًا)")
-                    rows = []
-                    for _, r in work.iterrows():
-                        amt = r['_credit'] if (r['_credit'] not in (None,) and r['_credit'] and r['_credit'] > 0) else r['_debit']
-                        direction = 'واردة (إيداع)' if (r['_credit'] and r['_credit'] > 0) else ('صادرة (سحب/تحويل)' if (r['_debit'] and r['_debit'] > 0) else None)
-                        if amt is None or direction is None:
-                            continue
-                        rows.append({
-                            'التاريخ': r[date_col] if date_col != '-- لا يوجد --' else '',
-                            'الاسم / الجهة': r['_party'],
-                            'المبلغ': amt,
-                            'نوع الحركة': direction,
-                            'طريقة العملية': r['_method'],
-                        })
-                    if rows:
-                        top_tx = pd.DataFrame(rows).sort_values('المبلغ', ascending=False).head(15)
-                        st.dataframe(top_tx, use_container_width=True)
+                    if top_tx_df is not None:
+                        st.dataframe(top_tx_df, use_container_width=True)
                     else:
                         st.info("حدد أعمدة الدائن/المدين لعرض أبرز العمليات.")
                 else:
-                    st.info(
-                        "لعرض تحليل (أبرز المودعين / المستفيدين / أكبر العمليات)، "
-                        "اختر عمود 'تفاصيل العملية' من القائمة أعلاه، لأن التحليل يعتمد على "
-                        "النص الوصفي لكل عملية لاستخراج اسم الطرف الآخر ونوع العملية."
-                    )
+                    st.info("اختر عمود 'تفاصيل العملية' أعلاه لعرض تحليل المودعين والمستفيدين وأكبر العمليات.")
