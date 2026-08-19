@@ -2,6 +2,6 @@ streamlit
 pandas
 pdfplumber
 openpyxl
-arabic-reshaper
-python-bidi
-
+pytesseract
+pdf2image
+Pillow
